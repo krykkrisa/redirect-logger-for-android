@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""
+redirect_logger.py
+
+Watches `adb logcat` live and logs every browser/VIEW-intent redirect
+(the kind silent adware triggers) into log_activity.txt in a clean,
+one-line-per-event format — including which app *triggered* the
+redirect, not just which app (browser) it opened in.
+
+Requirements:
+  - Android platform-tools (adb) installed and on PATH
+  - USB debugging enabled on the phone, phone connected & authorized
+  - Python 3
+
+Usage:
+  python redirect_logger.py
+
+Stop with Ctrl+C. Log file is created/appended in the same folder
+this script is run from, called log_activity.txt.
+"""
+
+import subprocess
+import re
+import sys
+import time
+from datetime import datetime
+
+LOG_FILE = "log_activity.txt"
+
+# Matches the START intent line and everything logcat appends after it
+# (from uid / pid), e.g.:
+# START u0 {act=android.intent.action.VIEW dat=https://x cmp=com.android.chrome/...} from uid:u0a188 pid:4521
+INTENT_RE = re.compile(
+    r"START u0 \{.*?act=android\.intent\.action\.VIEW"
+    r"(?:.*?dat=(?P<url>\S+))?"
+    r"(?:.*?cmp=(?P<component>\S+))?"
+    r".*?\}"
+    r"(?:.*?from uid:?\s*(?P<uid>\S+))?"
+)
+
+# uid can appear as a plain number ("10236") or android-style "u0a188"
+UID_APPID_RE = re.compile(r"^u(?P<user>\d+)a(?P<appid>\d+)$")
+
+DEDUPE_SECONDS = 5
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def check_device():
+    result = run(["adb", "get-state"])
+    if result.returncode != 0 or "device" not in result.stdout:
+        print("No adb device detected. Plug in phone, enable USB debugging, "
+              "and accept the RSA prompt on-screen, then re-run this script.")
+        sys.exit(1)
+
+
+def clear_logcat():
+    run(["adb", "logcat", "-c"])
+
+
+def build_uid_map():
+    """
+    Maps numeric uid -> package name using `pm list packages -U`.
+    Lets us turn 'from uid:u0a188' into the actual app that fired
+    the redirect, e.g. com.shady.adware.module
+    """
+    uid_map = {}
+    result = run(["adb", "shell", "pm", "list", "packages", "-U"])
+    if result.returncode != 0:
+        print("Warning: couldn't read package/uid list, app names may show as raw uid.")
+        return uid_map
+
+    for line in result.stdout.splitlines():
+        # format: package:com.example.app uid:10188
+        m = re.match(r"package:(?P<pkg>\S+)\s+uid:(?P<uid>\d+)", line.strip())
+        if m:
+            uid_map[int(m.group("uid"))] = m.group("pkg")
+    return uid_map
+
+
+def resolve_uid(raw_uid, uid_map):
+    if not raw_uid:
+        return None
+    # numeric uid straight from logcat
+    if raw_uid.isdigit():
+        return uid_map.get(int(raw_uid), f"uid:{raw_uid}")
+    # android-style u0a188 -> appid 188 -> uid 10188 (user 0)
+    m = UID_APPID_RE.match(raw_uid)
+    if m:
+        user = int(m.group("user"))
+        appid = int(m.group("appid"))
+        uid = user * 100000 + 10000 + appid
+        return uid_map.get(uid, f"uid:{raw_uid}")
+    return f"uid:{raw_uid}"
+
+
+def format_entry(url, component, source_app):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    opened_in = component.split("/")[0] if component else "unknown-app"
+    url = url if url else "(no url captured)"
+    source = source_app if source_app else "unknown"
+    return (f"[{ts}] REDIRECT -> triggered_by: {source:<32} "
+            f"opened_in: {opened_in:<28} url: {url}")
+
+
+def main():
+    check_device()
+    print("Building app/uid map...")
+    uid_map = build_uid_map()
+    clear_logcat()
+    print(f"Watching for redirects... writing to {LOG_FILE} (Ctrl+C to stop)")
+
+    last_seen = {}
+
+    with open(LOG_FILE, "a", encoding="utf-8") as logf:
+        proc = subprocess.Popen(
+            ["adb", "logcat", "-v", "brief", "ActivityTaskManager:I", "*:S"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        try:
+            for line in proc.stdout:
+                match = INTENT_RE.search(line)
+                if not match:
+                    continue
+
+                url = match.group("url")
+                component = match.group("component")
+                raw_uid = match.group("uid")
+
+                if not url and not component:
+                    continue
+
+                source_app = resolve_uid(raw_uid, uid_map)
+
+                key = (url, component, source_app)
+                now = time.time()
+                if key in last_seen and now - last_seen[key] < DEDUPE_SECONDS:
+                    continue
+                last_seen[key] = now
+
+                entry = format_entry(url, component, source_app)
+                print(entry)
+                logf.write(entry + "\n")
+                logf.flush()
+        except KeyboardInterrupt:
+            print("\nStopped.")
+        finally:
+            proc.terminate()
+
+
+if __name__ == "__main__":
+    main()
